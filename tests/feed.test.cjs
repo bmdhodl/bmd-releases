@@ -1,11 +1,16 @@
 'use strict';
 const test = require('node:test');
+const { before, after, mock } = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { validateFeed, verifyDownloaded, readLimited } = require('../scripts/check-feed.cjs');
+const { runInNewContext } = require('node:vm');
+const { validateFeed, verifyDownloaded, readLimited, checkFeed } = require('../scripts/check-feed.cjs');
+
+before(() => mock.method(globalThis, 'fetch', async () => { throw new Error('Tests must inject fetch; live networking refused'); }));
+after(() => mock.restoreAll());
 
 function fixture() {
   const bytes = Buffer.from('test installer bytes, never executable');
@@ -30,6 +35,76 @@ test('published manifest, API assets and update feed agree', () => {
   const f = fixture();
   assert.equal(validateFeed(f.release, f.manifest, f.metadata).name, f.name);
 });
+
+for (const releaseTag of [null, 'v1.2.3']) {
+  test(`audit reads the exact requested release: ${releaseTag || 'latest'}`, async () => {
+    const f = fixture();
+    const calls = [];
+    const fetcher = async (url, options = {}) => {
+      calls.push(url);
+      if (options.method === 'HEAD') {
+        const asset = f.release.assets.find(row => row.browser_download_url === url);
+        assert.ok(asset);
+        return new Response(null, { headers: { 'content-length': String(asset.size) } });
+      }
+      if (url.includes('api.github.com')) return new Response(JSON.stringify(f.release));
+      if (url.endsWith('bmd-release.json')) return new Response(JSON.stringify(f.manifest));
+      if (url.endsWith('latest.yml')) return new Response(JSON.stringify(f.metadata));
+      throw new Error(`Unexpected URL ${url}`);
+    };
+    const result = await checkFeed(false, { releaseTag, fetcher });
+    assert.equal(result.version, '1.2.3');
+    assert.equal(result.target, releaseTag || 'latest');
+    assert.ok(calls[0].endsWith(releaseTag ? '/releases/tags/v1.2.3' : '/releases/latest'));
+    assert.ok(calls[1].includes(releaseTag ? '/download/v1.2.3/' : '/latest/download/'));
+    assert.equal(calls.length, 5);
+    if (releaseTag) assert.ok(calls.every(url => !url.includes('/latest/download/')));
+  });
+}
+
+for (const releaseTag of ['../latest', 'v1.2.3/asset', '', 'v1.2.3-rc1']) {
+  test(`refuses invalid release target before networking: ${releaseTag}`, async () => {
+    let called = false;
+    await assert.rejects(checkFeed(false, { releaseTag, fetcher: async () => { called = true; } }), /Invalid release tag/);
+    assert.equal(called, false);
+  });
+}
+
+test('a tag API response cannot silently select a different release', async () => {
+  const f = fixture();
+  await assert.rejects(checkFeed(false, { releaseTag: 'v9.9.9', fetcher: async () => new Response(JSON.stringify(f.release)) }), /Requested release identity mismatch/);
+});
+
+test('publication concurrency keeps distinct release tags in distinct groups', () => {
+  const workflow = fs.readFileSync(path.join(__dirname, '../.github/workflows/feed-audit.yml'), 'utf8');
+  const group = workflow.match(/  group: (.+)/)[1];
+  const evaluate = (event, tag, schedule = '') => group.replace(/\$\{\{ (.*?) \}\}/g, (_, expression) =>
+    runInNewContext(expression, { github: { event_name: event, event: { release: { tag_name: tag }, schedule } } }));
+  const tags = ['v1.2.3', 'v1.2.4', 'v1.2.5'].map(tag => evaluate('release', tag));
+  assert.equal(new Set(tags).size, 3);
+  assert.notEqual(evaluate('schedule', '', '17 * * * *'), evaluate('schedule', '', '43 8 * * *'));
+  assert.equal(evaluate('release', 'v1.2.3'), evaluate('release', 'v1.2.3'));
+});
+
+for (const [event, schedule, prerelease, deep, metadata, installer] of [
+  ['release', '', false, false, true, false],
+  ['release', '', true, false, false, false],
+  ['schedule', '17 * * * *', false, false, true, false],
+  ['schedule', '43 8 * * *', false, false, false, true],
+  ['workflow_dispatch', '', false, false, true, false],
+  ['workflow_dispatch', '', false, true, false, true],
+]) {
+  test(`workflow admission ${event} / ${schedule} / prerelease=${prerelease} / deep=${deep}`, () => {
+    const workflow = fs.readFileSync(path.join(__dirname, '../.github/workflows/feed-audit.yml'), 'utf8');
+    assert.match(workflow, /release:\s+types: \[published\]/);
+    const context = { github: { event_name: event, event: { schedule, release: { prerelease } } }, inputs: { deep } };
+    for (const [job, expected] of [['metadata', metadata], ['installer', installer]]) {
+      const expression = workflow.match(new RegExp(`  ${job}:\\r?\\n    if: (.+)`))?.[1];
+      assert.ok(expression);
+      assert.equal(runInNewContext(expression, context), expected);
+    }
+  });
+}
 
 for (const [name, mutate] of [
   ['withdrawn manifest', f => { f.manifest.withdrawn = true; }],
