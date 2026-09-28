@@ -1,0 +1,57 @@
+name: Published release audit
+on:
+  schedule:
+    - cron: '17 * * * *'
+    - cron: '43 8 * * *'
+  workflow_dispatch:
+    inputs:
+      deep:
+        description: Download installer and check hashes and Windows signature
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: feed-audit-${{ github.event.schedule || github.event_name }}
+  cancel-in-progress: false
+jobs:
+  metadata:
+    if: github.event.schedule != '43 8 * * *' && !inputs.deep
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Public metadata and download readback
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/check-feed.cjs
+  installer:
+    if: github.event.schedule == '43 8 * * *' || inputs.deep
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Download and verify SHA256 and updater SHA512
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/check-feed.cjs --deep
+      - name: Read Authenticode signature without executing the installer
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem -LiteralPath dist/installer -Filter '*.exe')
+          if ($installers.Count -ne 1) { throw 'Expected exactly one installer' }
+          ./scripts/verify-signature.ps1 -Installer $installers[0].FullName
