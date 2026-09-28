@@ -1,10 +1,16 @@
 name: Published release audit
 on:
+  release:
+    types: [published]
   schedule:
     - cron: '17 * * * *'
     - cron: '43 8 * * *'
   workflow_dispatch:
     inputs:
+      release_tag:
+        description: Optional stable release tag to audit instead of the latest pointer
+        type: string
+        default: ''
       deep:
         description: Download installer and check hashes and Windows signature
         type: boolean
@@ -16,13 +22,16 @@ concurrency:
   cancel-in-progress: false
 jobs:
   metadata:
-    if: github.event.schedule != '43 8 * * *' && !inputs.deep
+    if: github.event.schedule != '43 8 * * *' && !inputs.deep && (github.event_name != 'release' || !github.event.release.prerelease)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
+          # Release tags may point to old feed-repository code. Audit their
+          # immutable assets with the current default-branch checker.
+          ref: ${{ github.event_name == 'release' && github.event.repository.default_branch || github.sha }}
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '24'
@@ -31,6 +40,7 @@ jobs:
       - name: Public metadata and download readback
         env:
           GH_TOKEN: ${{ github.token }}
+          BMD_RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
         run: node scripts/check-feed.cjs
   installer:
     if: github.event.schedule == '43 8 * * *' || inputs.deep
@@ -48,6 +58,7 @@ jobs:
       - name: Download and verify SHA256 and updater SHA512
         env:
           GH_TOKEN: ${{ github.token }}
+          BMD_RELEASE_TAG: ${{ inputs.release_tag }}
         run: node scripts/check-feed.cjs --deep
       - name: Read Authenticode signature without executing the installer
         shell: pwsh

@@ -73,34 +73,40 @@ async function readLimited(url, limit, options = {}, fetcher = fetch) {
   return Buffer.concat(chunks);
 }
 
-async function checkFeed(deep = false) {
+async function checkFeed(deep = false, { releaseTag = null, fetcher = fetch } = {}) {
+  requireValue(releaseTag === null || (typeof releaseTag === 'string' && /^v\d+\.\d+\.\d+$/.test(releaseTag)),
+    'Invalid release tag');
   const headers = { Accept: 'application/vnd.github+json', 'User-Agent': 'bmd-release-feed-check' };
   if (process.env.GH_TOKEN) headers.Authorization = `Bearer ${process.env.GH_TOKEN}`;
-  const release = JSON.parse(await readLimited(`https://api.github.com/repos/${REPOSITORY}/releases/latest`,
-    1024 * 1024, { headers }));
-  // Check the public latest pointer too. A split publication is a visible failure.
-  const manifest = JSON.parse(await readLimited(`${BASE}/latest/download/bmd-release.json`, 65536));
+  const selector = releaseTag === null ? 'latest' : `tags/${releaseTag}`;
+  const release = JSON.parse(await readLimited(`https://api.github.com/repos/${REPOSITORY}/releases/${selector}`,
+    1024 * 1024, { headers }, fetcher));
+  requireValue(releaseTag === null || release.tag_name === releaseTag, 'Requested release identity mismatch');
+  // Publication checks pin the event's tag. Scheduled checks additionally
+  // exercise the public latest pointer, which may have moved since publication.
+  const manifestPath = releaseTag === null ? 'latest/download' : `download/${releaseTag}`;
+  const manifest = JSON.parse(await readLimited(`${BASE}/${manifestPath}/bmd-release.json`, 65536, {}, fetcher));
   requireValue(typeof manifest.version === 'string' && /^\d+\.\d+\.\d+$/.test(manifest.version), 'Invalid version');
-  const updateBytes = await readLimited(`${BASE}/download/v${manifest.version}/latest.yml`, 65536);
+  const updateBytes = await readLimited(`${BASE}/download/v${manifest.version}/latest.yml`, 65536, {}, fetcher);
   const metadata = yaml.load(updateBytes.toString('utf8'));
   const selected = validateFeed(release, manifest, metadata);
   for (const name of [selected.name, selected.name + '.blockmap']) {
     const url = `${BASE}/download/v${manifest.version}/${name}`;
-    const response = await fetch(url, { method: 'HEAD', signal: AbortSignal.timeout(30000) });
+    const response = await fetcher(url, { method: 'HEAD', signal: AbortSignal.timeout(30000) });
     requireValue(response.ok, `Download unavailable: HTTP ${response.status} ${name}`);
     const declared = response.headers.get('content-length');
     const asset = release.assets.find(row => row.name === name);
     requireValue(declared !== null && Number(declared) === asset.size, `Download size mismatch: ${name}`);
   }
   if (deep) {
-    const data = await readLimited(manifest.installerUrl, manifest.bytes);
+    const data = await readLimited(manifest.installerUrl, manifest.bytes, {}, fetcher);
     const directory = path.resolve('dist/installer');
     fs.mkdirSync(directory, { recursive: true });
     fs.writeFileSync(path.join(directory, selected.name), data);
     fs.writeFileSync(path.join(directory, 'latest.yml'), updateBytes);
     verifyDownloaded(directory, manifest);
   }
-  return { ...selected, bytes: manifest.bytes, sha256: manifest.sha256,
+  return { ...selected, target: releaseTag || 'latest', bytes: manifest.bytes, sha256: manifest.sha256,
     metadata: 'passed', downloads: 'available', hashes: deep ? 'passed' : 'not checked',
     signature: 'not checked by this command' };
 }
@@ -108,6 +114,6 @@ async function checkFeed(deep = false) {
 module.exports = { validateFeed, verifyDownloaded, readLimited, checkFeed };
 if (require.main === module) {
   if (process.argv.slice(2).some(arg => arg !== '--deep')) throw new Error('Usage: check-feed.cjs [--deep]');
-  checkFeed(process.argv.includes('--deep')).then(result => console.log(JSON.stringify(result, null, 2)))
+  checkFeed(process.argv.includes('--deep'), { releaseTag: process.env.BMD_RELEASE_TAG || null }).then(result => console.log(JSON.stringify(result, null, 2)))
     .catch(error => { console.error(error.message); process.exitCode = 1; });
 }
