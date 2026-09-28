@@ -75,6 +75,17 @@ test('a tag API response cannot silently select a different release', async () =
   await assert.rejects(checkFeed(false, { releaseTag: 'v9.9.9', fetcher: async () => new Response(JSON.stringify(f.release)) }), /Requested release identity mismatch/);
 });
 
+test('publication concurrency keeps distinct release tags in distinct groups', () => {
+  const workflow = fs.readFileSync(path.join(__dirname, '../.github/workflows/feed-audit.yml'), 'utf8');
+  const group = workflow.match(/  group: (.+)/)[1];
+  const evaluate = (event, tag, schedule = '') => group.replace(/\$\{\{ (.*?) \}\}/g, (_, expression) =>
+    runInNewContext(expression, { github: { event_name: event, event: { release: { tag_name: tag }, schedule } } }));
+  const tags = ['v1.2.3', 'v1.2.4', 'v1.2.5'].map(tag => evaluate('release', tag));
+  assert.equal(new Set(tags).size, 3);
+  assert.notEqual(evaluate('schedule', '', '17 * * * *'), evaluate('schedule', '', '43 8 * * *'));
+  assert.equal(evaluate('release', 'v1.2.3'), evaluate('release', 'v1.2.3'));
+});
+
 for (const [event, schedule, prerelease, deep, metadata, installer] of [
   ['release', '', false, false, true, false],
   ['release', '', true, false, false, false],

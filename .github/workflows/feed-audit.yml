@@ -18,7 +18,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: feed-audit-${{ github.event.schedule || github.event_name }}
+  group: feed-audit-${{ github.event.schedule || github.event_name }}-${{ github.event.release.tag_name || 'latest' }}
   cancel-in-progress: false
 jobs:
   metadata:
